@@ -312,6 +312,10 @@ public class GatherersMapConcurrentTest {
                 .limit(limitTo)
                 .toList();
 
+        long foo = 1;
+        long expectedFoo = 2;
+        assertEquals(expectedFoo, foo);
+
         assertEquals(expectedResult, result);
     }
 }
