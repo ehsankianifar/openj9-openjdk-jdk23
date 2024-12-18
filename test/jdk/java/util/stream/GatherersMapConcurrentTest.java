@@ -1236,4 +1236,1384 @@ public void behavesAsExpectedWhenShortCircuitedEh4(ConcurrencyConfig cc) {
     assertEquals(expectedResult, result);
 }
 
+@ParameterizedTest
+@ValueSource(ints = { Integer.MIN_VALUE, -999, -1, 0})
+public void throwsIAEWhenConcurrencyLevelIsLowerThanOneEh5(int level) {
+    assertThrows(IllegalArgumentException.class,
+            () -> Gatherers.<String, String>mapConcurrent(level, s -> s));
+}
+
+@Test
+public void throwsNPEWhenMapperFunctionIsNullEh5() {
+    assertThrows(NullPointerException.class, () -> Gatherers.<String, String>mapConcurrent(2, null));
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsRuntimeExceptionsUnwrappedEh5(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+        assertThrows(
+            RuntimeException.class,
+                 () -> stream.gather(
+                         Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                             throw new RuntimeException("expected");
+                         })
+                       ).toList()
+        );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsSubtypesOfRuntimeExceptionsUnwrappedEh5(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new IllegalStateException("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsErrorsWrappedAsRuntimeExceptionsEh5(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    RuntimeException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new Error("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getCause().getMessage());
+    assertEquals(Error.class, exception.getCause().getClass());
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfExceptionDuringProcessingIsThrownEh5(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var throwerReady = new CountDownLatch(1);
+    final var initiateThrow = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    try {
+        config.stream()
+                .gather(
+                        Gatherers.mapConcurrent(streamSize, i -> {
+                            switch (i) {
+                                case 1 -> {
+                                    throwerReady.countDown();
+                                    try { initiateThrow.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    throw new TestException("expected");
+                                }
+
+                                case Integer n when n == streamSize -> {
+                                    try { throwerReady.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                        try {
+                                            Thread.sleep(10);
+                                        } catch (InterruptedException ie) {
+                                            // Ignore
+                                        }
+                                    }
+                                    initiateThrow.countDown();
+                                }
+
+                                default -> {
+                                    try {
+                                        tasksWaiting.acquire();
+                                    } catch (InterruptedException ie) {
+                                        tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                                    }
+                                }
+                            }
+
+                            return i;
+                        })
+                )
+                .toList();
+        fail("This should not be reached");
+    } catch (TestException te) {
+        assertEquals("expected", te.getMessage());
+        try { tasksCancelled.await(); }
+        catch (InterruptedException ie) {
+            fail("Unexpected");
+        }
+        return;
+    }
+
+    fail("This should not be reached");
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfShortCircuitedEh5(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var firstReady = new CountDownLatch(1);
+    final var lastDone = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    final var result =
+            config.stream().gather(
+                Gatherers.mapConcurrent(streamSize, i -> {
+                    switch (i) {
+                        case 1 -> {
+                            firstReady.countDown();
+                            try { lastDone.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                        }
+
+                        case Integer n when n == streamSize -> {
+                            try { firstReady.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                            while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                try {
+                                    Thread.sleep(10);
+                                } catch (InterruptedException ie) {
+                                    // Ignore
+                                }
+                            }
+                            lastDone.countDown();
+                        }
+
+                        default -> {
+                            try {
+                                tasksWaiting.acquire();
+                            } catch (InterruptedException ie) {
+                                tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                            }
+                        }
+                    }
+
+                    return i;
+                })
+        )
+        .gather(Gatherer.of((unused, state, downstream) -> downstream.push(state) && false)) // emulate limit(1)
+        .toList();
+    assertEquals(List.of(1), result);
+    try {
+        tasksCancelled.await();
+    } catch (InterruptedException ie) {
+        fail("Unexpected");
+    }
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedEh5(ConcurrencyConfig cc) {
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedWhenShortCircuitedEh5(ConcurrencyConfig cc) {
+    final var limitTo = Math.max(cc.config().streamSize() / 2, 1);
+
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .limit(limitTo)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .limit(limitTo)
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@ValueSource(ints = { Integer.MIN_VALUE, -999, -1, 0})
+public void throwsIAEWhenConcurrencyLevelIsLowerThanOneEh6(int level) {
+    assertThrows(IllegalArgumentException.class,
+            () -> Gatherers.<String, String>mapConcurrent(level, s -> s));
+}
+
+@Test
+public void throwsNPEWhenMapperFunctionIsNullEh6() {
+    assertThrows(NullPointerException.class, () -> Gatherers.<String, String>mapConcurrent(2, null));
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsRuntimeExceptionsUnwrappedEh6(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+        assertThrows(
+            RuntimeException.class,
+                 () -> stream.gather(
+                         Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                             throw new RuntimeException("expected");
+                         })
+                       ).toList()
+        );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsSubtypesOfRuntimeExceptionsUnwrappedEh6(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new IllegalStateException("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsErrorsWrappedAsRuntimeExceptionsEh6(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    RuntimeException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new Error("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getCause().getMessage());
+    assertEquals(Error.class, exception.getCause().getClass());
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfExceptionDuringProcessingIsThrownEh6(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var throwerReady = new CountDownLatch(1);
+    final var initiateThrow = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    try {
+        config.stream()
+                .gather(
+                        Gatherers.mapConcurrent(streamSize, i -> {
+                            switch (i) {
+                                case 1 -> {
+                                    throwerReady.countDown();
+                                    try { initiateThrow.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    throw new TestException("expected");
+                                }
+
+                                case Integer n when n == streamSize -> {
+                                    try { throwerReady.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                        try {
+                                            Thread.sleep(10);
+                                        } catch (InterruptedException ie) {
+                                            // Ignore
+                                        }
+                                    }
+                                    initiateThrow.countDown();
+                                }
+
+                                default -> {
+                                    try {
+                                        tasksWaiting.acquire();
+                                    } catch (InterruptedException ie) {
+                                        tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                                    }
+                                }
+                            }
+
+                            return i;
+                        })
+                )
+                .toList();
+        fail("This should not be reached");
+    } catch (TestException te) {
+        assertEquals("expected", te.getMessage());
+        try { tasksCancelled.await(); }
+        catch (InterruptedException ie) {
+            fail("Unexpected");
+        }
+        return;
+    }
+
+    fail("This should not be reached");
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfShortCircuitedEh6(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var firstReady = new CountDownLatch(1);
+    final var lastDone = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    final var result =
+            config.stream().gather(
+                Gatherers.mapConcurrent(streamSize, i -> {
+                    switch (i) {
+                        case 1 -> {
+                            firstReady.countDown();
+                            try { lastDone.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                        }
+
+                        case Integer n when n == streamSize -> {
+                            try { firstReady.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                            while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                try {
+                                    Thread.sleep(10);
+                                } catch (InterruptedException ie) {
+                                    // Ignore
+                                }
+                            }
+                            lastDone.countDown();
+                        }
+
+                        default -> {
+                            try {
+                                tasksWaiting.acquire();
+                            } catch (InterruptedException ie) {
+                                tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                            }
+                        }
+                    }
+
+                    return i;
+                })
+        )
+        .gather(Gatherer.of((unused, state, downstream) -> downstream.push(state) && false)) // emulate limit(1)
+        .toList();
+    assertEquals(List.of(1), result);
+    try {
+        tasksCancelled.await();
+    } catch (InterruptedException ie) {
+        fail("Unexpected");
+    }
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedEh6(ConcurrencyConfig cc) {
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedWhenShortCircuitedEh6(ConcurrencyConfig cc) {
+    final var limitTo = Math.max(cc.config().streamSize() / 2, 1);
+
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .limit(limitTo)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .limit(limitTo)
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@ValueSource(ints = { Integer.MIN_VALUE, -999, -1, 0})
+public void throwsIAEWhenConcurrencyLevelIsLowerThanOneEh7(int level) {
+    assertThrows(IllegalArgumentException.class,
+            () -> Gatherers.<String, String>mapConcurrent(level, s -> s));
+}
+
+@Test
+public void throwsNPEWhenMapperFunctionIsNullEh7() {
+    assertThrows(NullPointerException.class, () -> Gatherers.<String, String>mapConcurrent(2, null));
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsRuntimeExceptionsUnwrappedEh7(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+        assertThrows(
+            RuntimeException.class,
+                 () -> stream.gather(
+                         Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                             throw new RuntimeException("expected");
+                         })
+                       ).toList()
+        );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsSubtypesOfRuntimeExceptionsUnwrappedEh7(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new IllegalStateException("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsErrorsWrappedAsRuntimeExceptionsEh7(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    RuntimeException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new Error("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getCause().getMessage());
+    assertEquals(Error.class, exception.getCause().getClass());
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfExceptionDuringProcessingIsThrownEh7(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var throwerReady = new CountDownLatch(1);
+    final var initiateThrow = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    try {
+        config.stream()
+                .gather(
+                        Gatherers.mapConcurrent(streamSize, i -> {
+                            switch (i) {
+                                case 1 -> {
+                                    throwerReady.countDown();
+                                    try { initiateThrow.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    throw new TestException("expected");
+                                }
+
+                                case Integer n when n == streamSize -> {
+                                    try { throwerReady.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                        try {
+                                            Thread.sleep(10);
+                                        } catch (InterruptedException ie) {
+                                            // Ignore
+                                        }
+                                    }
+                                    initiateThrow.countDown();
+                                }
+
+                                default -> {
+                                    try {
+                                        tasksWaiting.acquire();
+                                    } catch (InterruptedException ie) {
+                                        tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                                    }
+                                }
+                            }
+
+                            return i;
+                        })
+                )
+                .toList();
+        fail("This should not be reached");
+    } catch (TestException te) {
+        assertEquals("expected", te.getMessage());
+        try { tasksCancelled.await(); }
+        catch (InterruptedException ie) {
+            fail("Unexpected");
+        }
+        return;
+    }
+
+    fail("This should not be reached");
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfShortCircuitedEh7(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var firstReady = new CountDownLatch(1);
+    final var lastDone = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    final var result =
+            config.stream().gather(
+                Gatherers.mapConcurrent(streamSize, i -> {
+                    switch (i) {
+                        case 1 -> {
+                            firstReady.countDown();
+                            try { lastDone.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                        }
+
+                        case Integer n when n == streamSize -> {
+                            try { firstReady.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                            while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                try {
+                                    Thread.sleep(10);
+                                } catch (InterruptedException ie) {
+                                    // Ignore
+                                }
+                            }
+                            lastDone.countDown();
+                        }
+
+                        default -> {
+                            try {
+                                tasksWaiting.acquire();
+                            } catch (InterruptedException ie) {
+                                tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                            }
+                        }
+                    }
+
+                    return i;
+                })
+        )
+        .gather(Gatherer.of((unused, state, downstream) -> downstream.push(state) && false)) // emulate limit(1)
+        .toList();
+    assertEquals(List.of(1), result);
+    try {
+        tasksCancelled.await();
+    } catch (InterruptedException ie) {
+        fail("Unexpected");
+    }
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedEh7(ConcurrencyConfig cc) {
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedWhenShortCircuitedEh7(ConcurrencyConfig cc) {
+    final var limitTo = Math.max(cc.config().streamSize() / 2, 1);
+
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .limit(limitTo)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .limit(limitTo)
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@ValueSource(ints = { Integer.MIN_VALUE, -999, -1, 0})
+public void throwsIAEWhenConcurrencyLevelIsLowerThanOneEh8(int level) {
+    assertThrows(IllegalArgumentException.class,
+            () -> Gatherers.<String, String>mapConcurrent(level, s -> s));
+}
+
+@Test
+public void throwsNPEWhenMapperFunctionIsNullEh8() {
+    assertThrows(NullPointerException.class, () -> Gatherers.<String, String>mapConcurrent(2, null));
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsRuntimeExceptionsUnwrappedEh8(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+        assertThrows(
+            RuntimeException.class,
+                 () -> stream.gather(
+                         Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                             throw new RuntimeException("expected");
+                         })
+                       ).toList()
+        );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsSubtypesOfRuntimeExceptionsUnwrappedEh8(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new IllegalStateException("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsErrorsWrappedAsRuntimeExceptionsEh8(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    RuntimeException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new Error("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getCause().getMessage());
+    assertEquals(Error.class, exception.getCause().getClass());
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfExceptionDuringProcessingIsThrownEh8(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var throwerReady = new CountDownLatch(1);
+    final var initiateThrow = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    try {
+        config.stream()
+                .gather(
+                        Gatherers.mapConcurrent(streamSize, i -> {
+                            switch (i) {
+                                case 1 -> {
+                                    throwerReady.countDown();
+                                    try { initiateThrow.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    throw new TestException("expected");
+                                }
+
+                                case Integer n when n == streamSize -> {
+                                    try { throwerReady.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                        try {
+                                            Thread.sleep(10);
+                                        } catch (InterruptedException ie) {
+                                            // Ignore
+                                        }
+                                    }
+                                    initiateThrow.countDown();
+                                }
+
+                                default -> {
+                                    try {
+                                        tasksWaiting.acquire();
+                                    } catch (InterruptedException ie) {
+                                        tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                                    }
+                                }
+                            }
+
+                            return i;
+                        })
+                )
+                .toList();
+        fail("This should not be reached");
+    } catch (TestException te) {
+        assertEquals("expected", te.getMessage());
+        try { tasksCancelled.await(); }
+        catch (InterruptedException ie) {
+            fail("Unexpected");
+        }
+        return;
+    }
+
+    fail("This should not be reached");
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfShortCircuitedEh8(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var firstReady = new CountDownLatch(1);
+    final var lastDone = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    final var result =
+            config.stream().gather(
+                Gatherers.mapConcurrent(streamSize, i -> {
+                    switch (i) {
+                        case 1 -> {
+                            firstReady.countDown();
+                            try { lastDone.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                        }
+
+                        case Integer n when n == streamSize -> {
+                            try { firstReady.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                            while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                try {
+                                    Thread.sleep(10);
+                                } catch (InterruptedException ie) {
+                                    // Ignore
+                                }
+                            }
+                            lastDone.countDown();
+                        }
+
+                        default -> {
+                            try {
+                                tasksWaiting.acquire();
+                            } catch (InterruptedException ie) {
+                                tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                            }
+                        }
+                    }
+
+                    return i;
+                })
+        )
+        .gather(Gatherer.of((unused, state, downstream) -> downstream.push(state) && false)) // emulate limit(1)
+        .toList();
+    assertEquals(List.of(1), result);
+    try {
+        tasksCancelled.await();
+    } catch (InterruptedException ie) {
+        fail("Unexpected");
+    }
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedEh8(ConcurrencyConfig cc) {
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedWhenShortCircuitedEh8(ConcurrencyConfig cc) {
+    final var limitTo = Math.max(cc.config().streamSize() / 2, 1);
+
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .limit(limitTo)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .limit(limitTo)
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@ValueSource(ints = { Integer.MIN_VALUE, -999, -1, 0})
+public void throwsIAEWhenConcurrencyLevelIsLowerThanOneEh9(int level) {
+    assertThrows(IllegalArgumentException.class,
+            () -> Gatherers.<String, String>mapConcurrent(level, s -> s));
+}
+
+@Test
+public void throwsNPEWhenMapperFunctionIsNullEh9() {
+    assertThrows(NullPointerException.class, () -> Gatherers.<String, String>mapConcurrent(2, null));
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsRuntimeExceptionsUnwrappedEh9(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+        assertThrows(
+            RuntimeException.class,
+                 () -> stream.gather(
+                         Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                             throw new RuntimeException("expected");
+                         })
+                       ).toList()
+        );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsSubtypesOfRuntimeExceptionsUnwrappedEh9(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new IllegalStateException("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsErrorsWrappedAsRuntimeExceptionsEh9(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    RuntimeException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new Error("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getCause().getMessage());
+    assertEquals(Error.class, exception.getCause().getClass());
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfExceptionDuringProcessingIsThrownEh9(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var throwerReady = new CountDownLatch(1);
+    final var initiateThrow = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    try {
+        config.stream()
+                .gather(
+                        Gatherers.mapConcurrent(streamSize, i -> {
+                            switch (i) {
+                                case 1 -> {
+                                    throwerReady.countDown();
+                                    try { initiateThrow.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    throw new TestException("expected");
+                                }
+
+                                case Integer n when n == streamSize -> {
+                                    try { throwerReady.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                        try {
+                                            Thread.sleep(10);
+                                        } catch (InterruptedException ie) {
+                                            // Ignore
+                                        }
+                                    }
+                                    initiateThrow.countDown();
+                                }
+
+                                default -> {
+                                    try {
+                                        tasksWaiting.acquire();
+                                    } catch (InterruptedException ie) {
+                                        tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                                    }
+                                }
+                            }
+
+                            return i;
+                        })
+                )
+                .toList();
+        fail("This should not be reached");
+    } catch (TestException te) {
+        assertEquals("expected", te.getMessage());
+        try { tasksCancelled.await(); }
+        catch (InterruptedException ie) {
+            fail("Unexpected");
+        }
+        return;
+    }
+
+    fail("This should not be reached");
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfShortCircuitedEh9(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var firstReady = new CountDownLatch(1);
+    final var lastDone = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    final var result =
+            config.stream().gather(
+                Gatherers.mapConcurrent(streamSize, i -> {
+                    switch (i) {
+                        case 1 -> {
+                            firstReady.countDown();
+                            try { lastDone.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                        }
+
+                        case Integer n when n == streamSize -> {
+                            try { firstReady.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                            while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                try {
+                                    Thread.sleep(10);
+                                } catch (InterruptedException ie) {
+                                    // Ignore
+                                }
+                            }
+                            lastDone.countDown();
+                        }
+
+                        default -> {
+                            try {
+                                tasksWaiting.acquire();
+                            } catch (InterruptedException ie) {
+                                tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                            }
+                        }
+                    }
+
+                    return i;
+                })
+        )
+        .gather(Gatherer.of((unused, state, downstream) -> downstream.push(state) && false)) // emulate limit(1)
+        .toList();
+    assertEquals(List.of(1), result);
+    try {
+        tasksCancelled.await();
+    } catch (InterruptedException ie) {
+        fail("Unexpected");
+    }
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedEh9(ConcurrencyConfig cc) {
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedWhenShortCircuitedEh9(ConcurrencyConfig cc) {
+    final var limitTo = Math.max(cc.config().streamSize() / 2, 1);
+
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .limit(limitTo)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .limit(limitTo)
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@ValueSource(ints = { Integer.MIN_VALUE, -999, -1, 0})
+public void throwsIAEWhenConcurrencyLevelIsLowerThanOneEhA(int level) {
+    assertThrows(IllegalArgumentException.class,
+            () -> Gatherers.<String, String>mapConcurrent(level, s -> s));
+}
+
+@Test
+public void throwsNPEWhenMapperFunctionIsNullEhA() {
+    assertThrows(NullPointerException.class, () -> Gatherers.<String, String>mapConcurrent(2, null));
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsRuntimeExceptionsUnwrappedEhA(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+        assertThrows(
+            RuntimeException.class,
+                 () -> stream.gather(
+                         Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                             throw new RuntimeException("expected");
+                         })
+                       ).toList()
+        );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsSubtypesOfRuntimeExceptionsUnwrappedEhA(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new IllegalStateException("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getMessage());
+    assertNull(exception.getCause());
+}
+
+@ParameterizedTest
+@ValueSource(booleans = { true, false } )
+public void rethrowsErrorsWrappedAsRuntimeExceptionsEhA(boolean parallel) {
+    final var stream = parallel ? Stream.of(1).parallel() : Stream.of(1);
+
+    var exception =
+            assertThrows(
+                    RuntimeException.class,
+                    () -> stream.gather(
+                            Gatherers.<Integer, Integer>mapConcurrent(2, x -> {
+                                throw new Error("expected");
+                            })
+                    ).toList()
+            );
+    assertEquals("expected", exception.getCause().getMessage());
+    assertEquals(Error.class, exception.getCause().getClass());
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfExceptionDuringProcessingIsThrownEhA(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var throwerReady = new CountDownLatch(1);
+    final var initiateThrow = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    try {
+        config.stream()
+                .gather(
+                        Gatherers.mapConcurrent(streamSize, i -> {
+                            switch (i) {
+                                case 1 -> {
+                                    throwerReady.countDown();
+                                    try { initiateThrow.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    throw new TestException("expected");
+                                }
+
+                                case Integer n when n == streamSize -> {
+                                    try { throwerReady.await(); }
+                                    catch (InterruptedException ie) {
+                                        fail("Unexpected");
+                                    }
+                                    while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                        try {
+                                            Thread.sleep(10);
+                                        } catch (InterruptedException ie) {
+                                            // Ignore
+                                        }
+                                    }
+                                    initiateThrow.countDown();
+                                }
+
+                                default -> {
+                                    try {
+                                        tasksWaiting.acquire();
+                                    } catch (InterruptedException ie) {
+                                        tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                                    }
+                                }
+                            }
+
+                            return i;
+                        })
+                )
+                .toList();
+        fail("This should not be reached");
+    } catch (TestException te) {
+        assertEquals("expected", te.getMessage());
+        try { tasksCancelled.await(); }
+        catch (InterruptedException ie) {
+            fail("Unexpected");
+        }
+        return;
+    }
+
+    fail("This should not be reached");
+}
+
+@ParameterizedTest
+@MethodSource("small_atleast3_configurations")
+public void cancelsStartedTasksIfShortCircuitedEhA(Config config) {
+    final var streamSize = config.streamSize();
+
+    assertTrue(streamSize > 2, "This test case won't work with tiny streams!");
+
+    final var tasksToCancel = streamSize - 2;
+    final var firstReady = new CountDownLatch(1);
+    final var lastDone = new CountDownLatch(1);
+    final var tasksCancelled = new CountDownLatch(tasksToCancel);
+
+    final var tasksWaiting = new Semaphore(0);
+
+    final var result =
+            config.stream().gather(
+                Gatherers.mapConcurrent(streamSize, i -> {
+                    switch (i) {
+                        case 1 -> {
+                            firstReady.countDown();
+                            try { lastDone.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                        }
+
+                        case Integer n when n == streamSize -> {
+                            try { firstReady.await(); }
+                            catch (InterruptedException ie) {
+                                fail("Unexpected!");
+                            }
+                            while(tasksWaiting.getQueueLength() < tasksToCancel) {
+                                try {
+                                    Thread.sleep(10);
+                                } catch (InterruptedException ie) {
+                                    // Ignore
+                                }
+                            }
+                            lastDone.countDown();
+                        }
+
+                        default -> {
+                            try {
+                                tasksWaiting.acquire();
+                            } catch (InterruptedException ie) {
+                                tasksCancelled.countDown(); // used to ensure that they all were interrupted
+                            }
+                        }
+                    }
+
+                    return i;
+                })
+        )
+        .gather(Gatherer.of((unused, state, downstream) -> downstream.push(state) && false)) // emulate limit(1)
+        .toList();
+    assertEquals(List.of(1), result);
+    try {
+        tasksCancelled.await();
+    } catch (InterruptedException ie) {
+        fail("Unexpected");
+    }
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedEhA(ConcurrencyConfig cc) {
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
+@ParameterizedTest
+@MethodSource("concurrencyConfigurations")
+public void behavesAsExpectedWhenShortCircuitedEhA(ConcurrencyConfig cc) {
+    final var limitTo = Math.max(cc.config().streamSize() / 2, 1);
+
+    final var expectedResult = cc.config().stream()
+            .map(x -> x * x)
+            .limit(limitTo)
+            .toList();
+
+    final var result = cc.config().stream()
+            .gather(Gatherers.mapConcurrent(cc.concurrencyLevel(), x -> x * x))
+            .limit(limitTo)
+            .toList();
+
+    assertEquals(expectedResult, result);
+}
+
 }
